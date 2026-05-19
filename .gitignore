@@ -1,0 +1,38 @@
+/.specstory
+
+# Build outputs
+/build/
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.log
+
+# CMake and MSVC
+/CMakeFiles/
+/CMakeCache.txt
+/*.sln
+/*.vcxproj
+/*.vcxproj.filters
+/*.vcxproj.user
+/.vs/
+
+# Python
+/.venv/
+__pycache__/
+*.pyc
+
+# Local runtime deps (do not commit)
+/onnxruntime-win-x64-gpu-1.24.4/
+/models/
+
+# WebView2 runtime cache (generated at run time)
+**/*.WebView2/
+
+# Local data outputs
+/data/*.yml
+
+# VS Code workspace settings
+/.vscode/
