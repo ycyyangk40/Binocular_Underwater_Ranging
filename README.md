@@ -1,4 +1,4 @@
-# CppOpenCVWebView
+# Binocular_Underwater_Ranging
 
 ## 概述
 本项目提供一套基于 OpenCV 的双目水下采集与处理流程，包含双目标定、极线校正、视差/深度估计，并可选集成基于 ONNX Runtime 的 YOLO 检测。同时提供 Win32 + WebView2 的桌面 UI，用于控制 CLI 并显示运行状态。
