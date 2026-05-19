@@ -1,28 +1,28 @@
 # CppOpenCVWebView
 
-## Overview
-This project provides a stereo underwater capture and processing pipeline based on OpenCV. It includes stereo calibration, rectification, disparity/depth estimation, and optional YOLO detection with ONNX Runtime. A Win32 + WebView2 UI is also included to control the CLI and show status.
+## 概述
+本项目提供一套基于 OpenCV 的双目水下采集与处理流程，包含双目标定、极线校正、视差/深度估计，并可选集成基于 ONNX Runtime 的 YOLO 检测。同时提供 Win32 + WebView2 的桌面 UI，用于控制 CLI 并显示运行状态。
 
-Outputs:
+产物:
 - CLI: `opencv_cli`
 - UI: `opencv_ui`
 
-## Requirements
+## 环境与依赖
 - Windows
 - CMake 3.20+
-- Visual Studio 2022 (or another MSVC toolset)
-- OpenCV (set `OpenCV_DIR` to your OpenCV build folder)
-- WebView2 SDK (auto-downloaded via CMake)
-- Optional: ONNX Runtime for YOLO (`ENABLE_YOLO=ON` and `ONNXRUNTIME_ROOT`)
+- Visual Studio 2022 (或其他 MSVC 工具链)
+- OpenCV (通过 `OpenCV_DIR` 指向你的 OpenCV build 目录)
+- WebView2 SDK (CMake 自动下载)
+- 可选: ONNX Runtime (YOLO 支持, 需 `ENABLE_YOLO=ON` 与 `ONNXRUNTIME_ROOT`)
 
-## Build (CMake)
+## 构建 (CMake)
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DOpenCV_DIR=D:/OpenCV/opencv/build
 cmake --build build --config Debug
 ```
 
-### Enable YOLO
-Place ONNX Runtime under a known path and point CMake to it:
+### 启用 YOLO
+将 ONNX Runtime 放在已知路径, 并在 CMake 中指定:
 
 ```bash
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
@@ -32,7 +32,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
 cmake --build build --config Debug
 ```
 
-## Run
+## 运行
 ### CLI
 ```bash
 opencv_cli.exe 0 depth
@@ -43,17 +43,17 @@ opencv_cli.exe 0 depth
 opencv_ui.exe
 ```
 
-## CLI Modes
-- `calib`: interactive stereo calibration
-- `rectify`: show rectified stereo
-- `depth`: compute disparity and depth map
-- `yolo`: YOLO detection with depth fusion (requires ONNX Runtime)
-- `video`: basic stereo preview (default)
+## CLI 模式
+- `calib`: 交互式双目标定
+- `rectify`: 显示极线校正后的双目画面
+- `depth`: 计算视差与深度图
+- `yolo`: YOLO 检测并融合深度信息 (需要 ONNX Runtime)
+- `video`: 基础双目预览 (默认)
 
-## CLI Arguments
-Usage: `opencv_cli.exe [camera] [mode] [options]`
+## CLI 参数
+用法: `opencv_cli.exe [camera] [mode] [options]`
 
-Options:
+参数:
 - `--mode <name>`
 - `--view left|right|both`
 - `--binary`
@@ -69,28 +69,28 @@ Options:
 - `--board-width <n>`
 - `--square-size <meters>`
 
-## Calibration Outputs
-Calibration data is stored under `data/`:
+## 标定输出
+标定数据保存在 `data/` 下:
 - `data/left_intrinsics.yml`
 - `data/right_intrinsics.yml`
 - `data/stereo.yml`
 
-These files are required for `rectify`, `depth`, and `yolo`.
+`rectify`、`depth`、`yolo` 需要这些文件。
 
-## Model Files
-Default model path:
+## 模型文件
+默认模型路径:
 - `models/yolov8l.onnx`
 
-You can override this with `--model <path>`.
+可通过 `--model <path>` 覆盖。
 
-## Project Structure
-- `main.cpp`: CLI entry
-- `src/mode_*.cpp`: mode implementations
-- `src/webview_main.cpp`: UI entry
-- `src/webview_app.cpp`: WebView2 host
-- `web/`: UI assets
+## 项目结构
+- `main.cpp`: CLI 入口
+- `src/mode_*.cpp`: 模式实现
+- `src/webview_main.cpp`: UI 入口
+- `src/webview_app.cpp`: WebView2 宿主
+- `web/`: UI 资源
 
-## Notes
-- OpenCV and ONNX Runtime DLLs are copied to the build output directory after build.
-- WebView2 SDK is downloaded automatically during CMake configure.
+## 说明
+- OpenCV 与 ONNX Runtime 的 DLL 会在构建后复制到输出目录。
+- WebView2 SDK 在 CMake configure 阶段自动下载。
 
