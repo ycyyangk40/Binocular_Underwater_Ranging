@@ -310,19 +310,14 @@ public:
 		sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 		sessionOptions.SetIntraOpNumThreads(1);
 
-#ifdef YOLO_USE_ONNXRUNTIME
-		try {
-			Ort::CUDAProviderOptions cudaOptions;
-			cudaOptions.Update({{"device_id", "0"}});
-			sessionOptions.AppendExecutionProvider_CUDA_V2(*cudaOptions);
-			std::cout << "ONNX Runtime CUDA provider enabled.\n";
-		} catch (const std::exception& ex) {
-			std::cout << "CUDA provider unavailable, falling back to CPU: " << ex.what() << "\n";
-		}
-#endif
+		std::cout << "ONNX Runtime CPU provider enabled.\n";
 
+#ifdef _WIN32
 		std::wstring modelPathW = std::filesystem::path(modelPath).wstring();
-			session_ = std::make_unique<Ort::Session>(env_, modelPathW.c_str(), sessionOptions);
+		session_ = std::make_unique<Ort::Session>(env_, modelPathW.c_str(), sessionOptions);
+#else
+		session_ = std::make_unique<Ort::Session>(env_, modelPath.c_str(), sessionOptions);
+#endif
 
 		Ort::AllocatorWithDefaultOptions allocator;
 		for (size_t i = 0; i < session_->GetInputCount(); ++i) {

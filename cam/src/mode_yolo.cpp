@@ -12,8 +12,16 @@
 #include <onnxruntime_cxx_api.h>
 #endif
 
+#ifdef YOLO_USE_TENSORRT
+#include <NvInfer.h>
+#include <NvInferPlugin.h>
+#include <cuda_runtime_api.h>
+#include <fstream>
+#endif
+
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -26,7 +34,7 @@
 #include <utility>
 #include <vector>
 
-#ifdef YOLO_USE_ONNXRUNTIME
+#if defined(YOLO_USE_ONNXRUNTIME) || defined(YOLO_USE_TENSORRT)
 
 namespace {
 
@@ -254,7 +262,6 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 
 	if (r.valid_points < cfg.min_valid_points || r.valid_ratio < cfg.min_valid_ratio) return r;
 
-	// Primary: trimmed median (proven robust)
 	std::sort(values.begin(), values.end());
 	int n = static_cast<int>(values.size());
 	int left = static_cast<int>(n * cfg.trim_ratio);
@@ -277,7 +284,6 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 	r.method = DepthMethod::TrimmedMedian;
 	r.distance_m = r.raw_median_m;
 
-	// Secondary: histogram peak (for debug / future upgrade)
 	HistogramPeakResult peak = findHistogramPeak(values, cfg.hist_bin_width_m);
 	bool peakOk = peak.valid
 		&& peak.peak_points >= cfg.min_peak_points
@@ -298,9 +304,20 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 	return r;
 }
 
-class YoloDetector {
+class IYoloDetector {
 public:
-	explicit YoloDetector(const std::string& modelPath)
+	virtual ~IYoloDetector() = default;
+	virtual std::vector<YoloDetection> Detect(
+		const cv::Mat& image,
+		float confThreshold = 0.25f,
+		float nmsThreshold = 0.45f) = 0;
+};
+
+#ifdef YOLO_USE_ONNXRUNTIME
+
+class OrtYoloDetector : public IYoloDetector {
+public:
+	explicit OrtYoloDetector(const std::string& modelPath)
 		: env_(ORT_LOGGING_LEVEL_WARNING, "yolo") {
 		if (!std::filesystem::exists(modelPath)) {
 			throw std::runtime_error("YOLO model not found: " + modelPath);
@@ -310,19 +327,14 @@ public:
 		sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 		sessionOptions.SetIntraOpNumThreads(1);
 
-#ifdef YOLO_USE_ONNXRUNTIME
-		try {
-			Ort::CUDAProviderOptions cudaOptions;
-			cudaOptions.Update({{"device_id", "0"}});
-			sessionOptions.AppendExecutionProvider_CUDA_V2(*cudaOptions);
-			std::cout << "ONNX Runtime CUDA provider enabled.\n";
-		} catch (const std::exception& ex) {
-			std::cout << "CUDA provider unavailable, falling back to CPU: " << ex.what() << "\n";
-		}
-#endif
+		std::cout << "ONNX Runtime CPU provider enabled.\n";
 
+#ifdef _WIN32
 		std::wstring modelPathW = std::filesystem::path(modelPath).wstring();
-			session_ = std::make_unique<Ort::Session>(env_, modelPathW.c_str(), sessionOptions);
+		session_ = std::make_unique<Ort::Session>(env_, modelPathW.c_str(), sessionOptions);
+#else
+		session_ = std::make_unique<Ort::Session>(env_, modelPath.c_str(), sessionOptions);
+#endif
 
 		Ort::AllocatorWithDefaultOptions allocator;
 		for (size_t i = 0; i < session_->GetInputCount(); ++i) {
@@ -335,7 +347,7 @@ public:
 		}
 	}
 
-	std::vector<YoloDetection> Detect(const cv::Mat& image, float confThreshold = 0.25f, float nmsThreshold = 0.45f) {
+	std::vector<YoloDetection> Detect(const cv::Mat& image, float confThreshold = 0.25f, float nmsThreshold = 0.45f) override {
 		LetterboxInfo letterboxInfo;
 		cv::Mat letterboxed = Letterbox(image, cv::Size(640, 640), letterboxInfo);
 		cv::Mat blob = cv::dnn::blobFromImage(letterboxed, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
@@ -366,6 +378,21 @@ public:
 			throw std::runtime_error("YOLO output does not contain enough attributes.");
 		}
 
+		return decodeOutput(data, predictionCount, attributeCount, channelFirst,
+			image, letterboxInfo, confThreshold, nmsThreshold);
+	}
+
+private:
+	Ort::Env env_;
+	std::unique_ptr<Ort::Session> session_;
+	Ort::MemoryInfo memoryInfo_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+	std::vector<std::string> inputNames_;
+	std::vector<std::string> outputNames_;
+
+	static std::vector<YoloDetection> decodeOutput(float* data, int64_t predictionCount,
+		int64_t attributeCount, bool channelFirst, const cv::Mat& image,
+		const LetterboxInfo& letterboxInfo, float confThreshold, float nmsThreshold) {
+
 		std::vector<cv::Rect> boxes;
 		std::vector<float> scores;
 		std::vector<int> classIds;
@@ -374,10 +401,7 @@ public:
 		classIds.reserve(static_cast<size_t>(predictionCount));
 
 		for (int64_t i = 0; i < predictionCount; ++i) {
-			float cx = 0.0f;
-			float cy = 0.0f;
-			float w = 0.0f;
-			float h = 0.0f;
+			float cx, cy, w, h;
 			if (channelFirst) {
 				cx = data[0 * predictionCount + i];
 				cy = data[1 * predictionCount + i];
@@ -400,9 +424,219 @@ public:
 				}
 			}
 
-			if (bestScore < confThreshold || bestClass < 0) {
-				continue;
+			if (bestScore < confThreshold || bestClass < 0) continue;
+
+			float x1 = (cx - w * 0.5f - static_cast<float>(letterboxInfo.padX)) / letterboxInfo.scale;
+			float y1 = (cy - h * 0.5f - static_cast<float>(letterboxInfo.padY)) / letterboxInfo.scale;
+			float x2 = (cx + w * 0.5f - static_cast<float>(letterboxInfo.padX)) / letterboxInfo.scale;
+			float y2 = (cy + h * 0.5f - static_cast<float>(letterboxInfo.padY)) / letterboxInfo.scale;
+
+			x1 = std::clamp(x1, 0.0f, static_cast<float>(image.cols - 1));
+			y1 = std::clamp(y1, 0.0f, static_cast<float>(image.rows - 1));
+			x2 = std::clamp(x2, 0.0f, static_cast<float>(image.cols - 1));
+			y2 = std::clamp(y2, 0.0f, static_cast<float>(image.rows - 1));
+
+			int left = static_cast<int>(std::round(x1));
+			int top = static_cast<int>(std::round(y1));
+			int width = std::max(1, static_cast<int>(std::round(x2 - x1)));
+			int height = std::max(1, static_cast<int>(std::round(y2 - y1)));
+			boxes.emplace_back(left, top, width, height);
+			scores.push_back(bestScore);
+			classIds.push_back(bestClass);
+		}
+
+		std::vector<int> keep;
+		cv::dnn::NMSBoxes(boxes, scores, confThreshold, nmsThreshold, keep);
+
+		std::vector<YoloDetection> detections;
+		detections.reserve(keep.size());
+		for (int idx : keep) {
+			YoloDetection det;
+			det.classId = classIds[static_cast<size_t>(idx)];
+			det.confidence = scores[static_cast<size_t>(idx)];
+			det.box = boxes[static_cast<size_t>(idx)];
+			detections.push_back(det);
+		}
+		return detections;
+	}
+};
+
+#endif  // YOLO_USE_ONNXRUNTIME
+
+#ifdef YOLO_USE_TENSORRT
+
+class TrtLogger : public nvinfer1::ILogger {
+public:
+	void log(Severity severity, const char* msg) noexcept override {
+		if (severity <= Severity::kWARNING) {
+			std::cout << "[TRT] " << msg << "\n";
+		}
+	}
+};
+
+template <typename T>
+struct TrtDestroy {
+	void operator()(T* obj) const {
+		if (obj) obj->destroy();
+	}
+};
+
+template <typename T>
+using TrtUniquePtr = std::unique_ptr<T, TrtDestroy<T>>;
+
+static int64_t volume(const nvinfer1::Dims& dims) {
+	int64_t v = 1;
+	for (int i = 0; i < dims.nbDims; ++i) v *= dims.d[i];
+	return v;
+}
+
+static void checkCuda(cudaError_t err, const char* msg) {
+	if (err != cudaSuccess) {
+		throw std::runtime_error(std::string(msg) + ": " + cudaGetErrorString(err));
+	}
+}
+
+class TrtYoloDetector : public IYoloDetector {
+public:
+	explicit TrtYoloDetector(const std::string& enginePath) {
+		if (!std::filesystem::exists(enginePath)) {
+			throw std::runtime_error("TensorRT engine not found: " + enginePath);
+		}
+
+		std::ifstream file(enginePath, std::ios::binary);
+		if (!file) {
+			throw std::runtime_error("Failed to open TensorRT engine: " + enginePath);
+		}
+
+		file.seekg(0, std::ios::end);
+		size_t size = static_cast<size_t>(file.tellg());
+		file.seekg(0, std::ios::beg);
+
+		std::vector<char> engineData(size);
+		file.read(engineData.data(), size);
+
+		initLibNvInferPlugins(&logger_, "");
+
+		runtime_.reset(nvinfer1::createInferRuntime(logger_));
+		if (!runtime_) throw std::runtime_error("createInferRuntime failed");
+
+		engine_.reset(runtime_->deserializeCudaEngine(engineData.data(), engineData.size()));
+		if (!engine_) throw std::runtime_error("deserializeCudaEngine failed");
+
+		context_.reset(engine_->createExecutionContext());
+		if (!context_) throw std::runtime_error("createExecutionContext failed");
+
+		for (int i = 0; i < engine_->getNbBindings(); ++i) {
+			if (engine_->bindingIsInput(i)) inputIndex_ = i;
+			else outputIndex_ = i;
+		}
+
+		if (inputIndex_ < 0 || outputIndex_ < 0)
+			throw std::runtime_error("TensorRT binding index invalid");
+
+		nvinfer1::Dims inputDims = engine_->getBindingDimensions(inputIndex_);
+		bool dynamic = false;
+		for (int i = 0; i < inputDims.nbDims; ++i)
+			if (inputDims.d[i] < 0) dynamic = true;
+
+		if (dynamic) {
+			nvinfer1::Dims4 fixedInputDims(1, 3, 640, 640);
+			if (!context_->setBindingDimensions(inputIndex_, fixedInputDims))
+				throw std::runtime_error("setBindingDimensions failed");
+			inputDims = fixedInputDims;
+		}
+
+		nvinfer1::Dims outputDims = context_->getBindingDimensions(outputIndex_);
+		inputCount_ = volume(inputDims);
+		outputCount_ = volume(outputDims);
+
+		if (inputCount_ != 1 * 3 * 640 * 640)
+			std::cout << "[TRT] Warning: unexpected input count = " << inputCount_ << "\n";
+
+		outputShape_.clear();
+		for (int i = 0; i < outputDims.nbDims; ++i)
+			outputShape_.push_back(outputDims.d[i]);
+
+		outputHost_.resize(static_cast<size_t>(outputCount_));
+
+		checkCuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
+		checkCuda(cudaMalloc(&inputDevice_, inputCount_ * sizeof(float)), "cudaMalloc input");
+		checkCuda(cudaMalloc(&outputDevice_, outputCount_ * sizeof(float)), "cudaMalloc output");
+
+		std::cout << "TensorRT GPU backend enabled.\n";
+		std::cout << "[TRT] input binding:  " << engine_->getBindingName(inputIndex_) << "\n";
+		std::cout << "[TRT] output binding: " << engine_->getBindingName(outputIndex_) << "\n";
+		std::cout << "[TRT] output count:   " << outputCount_ << "\n";
+	}
+
+	~TrtYoloDetector() override {
+		if (inputDevice_) cudaFree(inputDevice_);
+		if (outputDevice_) cudaFree(outputDevice_);
+		if (stream_) cudaStreamDestroy(stream_);
+	}
+
+	std::vector<YoloDetection> Detect(const cv::Mat& image, float confThreshold = 0.25f, float nmsThreshold = 0.45f) override {
+		LetterboxInfo letterboxInfo;
+		cv::Mat letterboxed = Letterbox(image, cv::Size(640, 640), letterboxInfo);
+		cv::Mat blob = cv::dnn::blobFromImage(letterboxed, 1.0 / 255.0,
+			cv::Size(640, 640), cv::Scalar(), true, false, CV_32F);
+
+		checkCuda(cudaMemcpyAsync(inputDevice_, blob.ptr<float>(),
+			inputCount_ * sizeof(float), cudaMemcpyHostToDevice, stream_), "cudaMemcpyAsync H2D");
+
+		void* bindings[2];
+		bindings[inputIndex_] = inputDevice_;
+		bindings[outputIndex_] = outputDevice_;
+
+		if (!context_->enqueueV2(bindings, stream_, nullptr))
+			throw std::runtime_error("TensorRT enqueueV2 failed");
+
+		checkCuda(cudaMemcpyAsync(outputHost_.data(), outputDevice_,
+			outputCount_ * sizeof(float), cudaMemcpyDeviceToHost, stream_), "cudaMemcpyAsync D2H");
+
+		checkCuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+
+		int64_t dim1 = outputShape_.size() >= 2 ? outputShape_[1] : 0;
+		int64_t dim2 = outputShape_.size() >= 3 ? outputShape_[2] : 0;
+		bool channelFirst = dim1 < dim2;
+		int64_t predictionCount = channelFirst ? dim2 : dim1;
+		int64_t attributeCount = channelFirst ? dim1 : dim2;
+
+		if (attributeCount < 5) {
+			std::cerr << "[TRT] Warning: unexpected output shape, not enough attributes.\n";
+			return {};
+		}
+
+		float* data = outputHost_.data();
+		std::vector<cv::Rect> boxes;
+		std::vector<float> scores;
+		std::vector<int> classIds;
+		boxes.reserve(static_cast<size_t>(predictionCount));
+		scores.reserve(static_cast<size_t>(predictionCount));
+		classIds.reserve(static_cast<size_t>(predictionCount));
+
+		for (int64_t i = 0; i < predictionCount; ++i) {
+			float cx, cy, w, h;
+			if (channelFirst) {
+				cx = data[0 * predictionCount + i];
+				cy = data[1 * predictionCount + i];
+				w = data[2 * predictionCount + i];
+				h = data[3 * predictionCount + i];
+			} else {
+				cx = data[i * attributeCount + 0];
+				cy = data[i * attributeCount + 1];
+				w = data[i * attributeCount + 2];
+				h = data[i * attributeCount + 3];
 			}
+
+			float bestScore = 0.0f;
+			int bestClass = -1;
+			for (int64_t c = 4; c < attributeCount; ++c) {
+				float score = channelFirst ? data[c * predictionCount + i] : data[i * attributeCount + c];
+				if (score > bestScore) { bestScore = score; bestClass = static_cast<int>(c - 4); }
+			}
+
+			if (bestScore < confThreshold || bestClass < 0) continue;
 
 			float x1 = (cx - w * 0.5f - static_cast<float>(letterboxInfo.padX)) / letterboxInfo.scale;
 			float y1 = (cy - h * 0.5f - static_cast<float>(letterboxInfo.padY)) / letterboxInfo.scale;
@@ -439,43 +673,43 @@ public:
 	}
 
 private:
-	Ort::Env env_;
-	std::unique_ptr<Ort::Session> session_;
-	Ort::MemoryInfo memoryInfo_ = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-	std::vector<std::string> inputNames_;
-	std::vector<std::string> outputNames_;
+	TrtLogger logger_;
+	TrtUniquePtr<nvinfer1::IRuntime> runtime_{nullptr};
+	TrtUniquePtr<nvinfer1::ICudaEngine> engine_{nullptr};
+	TrtUniquePtr<nvinfer1::IExecutionContext> context_{nullptr};
+
+	int inputIndex_ = -1;
+	int outputIndex_ = -1;
+
+	int64_t inputCount_ = 0;
+	int64_t outputCount_ = 0;
+	std::vector<int64_t> outputShape_;
+	std::vector<float> outputHost_;
+
+	void* inputDevice_ = nullptr;
+	void* outputDevice_ = nullptr;
+	cudaStream_t stream_ = nullptr;
 };
 
+#endif  // YOLO_USE_TENSORRT
+
 void onDepthClick(int event, int x, int y, int, void* userdata) {
-	if (event != cv::EVENT_LBUTTONDOWN || userdata == nullptr) {
-		return;
-	}
+	if (event != cv::EVENT_LBUTTONDOWN || userdata == nullptr) return;
 	auto* ctx = static_cast<DepthContext*>(userdata);
-	if (ctx->depthMeters.empty()) {
-		std::cout << "Depth data not ready.\n";
-		return;
-	}
-	if (x < 0 || y < 0 || x >= ctx->depthMeters.cols || y >= ctx->depthMeters.rows) {
-		return;
-	}
+	if (ctx->depthMeters.empty()) { std::cout << "Depth data not ready.\n"; return; }
+	if (x < 0 || y < 0 || x >= ctx->depthMeters.cols || y >= ctx->depthMeters.rows) return;
 	int x0 = std::max(0, x - 2);
 	int x1 = std::min(ctx->depthMeters.cols - 1, x + 2);
 	int y0 = std::max(0, y - 2);
 	int y1 = std::min(ctx->depthMeters.rows - 1, y + 2);
 
 	std::vector<float> samples;
-	for (int yy = y0; yy <= y1; ++yy) {
+	for (int yy = y0; yy <= y1; ++yy)
 		for (int xx = x0; xx <= x1; ++xx) {
 			float depth = ctx->depthMeters.at<float>(yy, xx);
-			if (std::isfinite(depth) && depth > 0.08f && depth < 5.0f) {
-				samples.push_back(depth);
-			}
+			if (std::isfinite(depth) && depth > 0.08f && depth < 5.0f) samples.push_back(depth);
 		}
-	}
-	if (samples.empty()) {
-		std::cout << "Invalid depth at (" << x << ", " << y << ")\n";
-		return;
-	}
+	if (samples.empty()) { std::cout << "Invalid depth at (" << x << ", " << y << ")\n"; return; }
 	std::nth_element(samples.begin(), samples.begin() + samples.size() / 2, samples.end());
 	std::cout << "Point(" << x << ", " << y << ") depth=" << samples[samples.size() / 2] << " m\n";
 }
@@ -496,57 +730,55 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		if (!openStereoCamera(capture, cameraDeviceNo)) return;
 		cv::Mat frame;
 		while (capture.read(frame)) {
-			if (!frame.empty()) {
-				cv::imshow("yolo", frame);
-			}
+			if (!frame.empty()) cv::imshow("yolo", frame);
 			int key = cv::waitKey(1);
-			if (key == 'Q' || key == 'q') {
-				break;
-			}
+			if (key == 'Q' || key == 'q') break;
 		}
 		return;
 	}
 
-	YoloDetector detector(modelPath);
+	std::unique_ptr<IYoloDetector> detector;
+	std::string ext = std::filesystem::path(modelPath).extension().string();
+	std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+		return static_cast<char>(std::tolower(c));
+	});
+
+	if (ext == ".engine") {
+#ifdef YOLO_USE_TENSORRT
+		detector = std::make_unique<TrtYoloDetector>(modelPath);
+#else
+		std::cerr << "TensorRT backend not enabled. Rebuild with -DENABLE_TENSORRT=ON.\n";
+		return;
+#endif
+	} else {
+#ifdef YOLO_USE_ONNXRUNTIME
+		detector = std::make_unique<OrtYoloDetector>(modelPath);
+#else
+		std::cerr << "ONNX Runtime backend not enabled. Rebuild with -DENABLE_ONNXRUNTIME=ON.\n";
+		return;
+#endif
+	}
 
 	cv::Mat cameraMatrixLeft, distCoeffsLeft;
 	cv::Mat cameraMatrixRight, distCoeffsRight;
 	cv::Mat R, T;
 	float calibSquareSize = 0.0f;
-	if (!loadIntrinsics("data/left_intrinsics.yml", cameraMatrixLeft, distCoeffsLeft)) {
-		return;
-	}
-	if (!loadIntrinsics("data/right_intrinsics.yml", cameraMatrixRight, distCoeffsRight)) {
-		return;
-	}
-	if (!loadStereoRT("data/stereo.yml", R, T, &calibSquareSize)) {
-		return;
-	}
+	if (!loadIntrinsics("data/left_intrinsics.yml", cameraMatrixLeft, distCoeffsLeft)) return;
+	if (!loadIntrinsics("data/right_intrinsics.yml", cameraMatrixRight, distCoeffsRight)) return;
+	if (!loadStereoRT("data/stereo.yml", R, T, &calibSquareSize)) return;
 
 	cv::VideoCapture capture;
 	if (!openStereoCamera(capture, cameraDeviceNo)) return;
 
-	if (showLeft) {
-		cv::namedWindow("left", cv::WINDOW_GUI_EXPANDED);
-		cv::resizeWindow("left", 1280, 720);
-	}
-	if (showRight) {
-		cv::namedWindow("right", cv::WINDOW_GUI_EXPANDED);
-		cv::resizeWindow("right", 1280, 720);
-	}
-	if (showDepth) {
-		cv::namedWindow("depth", cv::WINDOW_GUI_EXPANDED);
-		cv::resizeWindow("depth", 1280, 720);
-	}
+	if (showLeft) { cv::namedWindow("left", cv::WINDOW_GUI_EXPANDED); cv::resizeWindow("left", 1280, 720); }
+	if (showRight) { cv::namedWindow("right", cv::WINDOW_GUI_EXPANDED); cv::resizeWindow("right", 1280, 720); }
+	if (showDepth) { cv::namedWindow("depth", cv::WINDOW_GUI_EXPANDED); cv::resizeWindow("depth", 1280, 720); }
 	cv::namedWindow("yolo", cv::WINDOW_GUI_EXPANDED);
 	cv::resizeWindow("yolo", 1280, 720);
 
 	double unitToMeter = 0.01;
-	if (calibSquareSize > 0.0f && calibSquareSize < 0.5f) {
-		unitToMeter = 1.0;
-	} else if (calibSquareSize >= 10.0f) {
-		unitToMeter = 0.001;
-	}
+	if (calibSquareSize > 0.0f && calibSquareSize < 0.5f) unitToMeter = 1.0;
+	else if (calibSquareSize >= 10.0f) unitToMeter = 0.001;
 	double baselineMeters = cv::norm(T) * unitToMeter;
 	double fx = cameraMatrixLeft.at<double>(0, 0);
 	std::cout << "Stereo baseline=" << baselineMeters << " m, fx=" << fx << " px\n";
@@ -572,9 +804,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 	stereoBM->setDisp12MaxDiff(1);
 
 	DepthContext depthContext;
-	if (showDepth) {
-		cv::setMouseCallback("depth", onDepthClick, &depthContext);
-	}
+	if (showDepth) cv::setMouseCallback("depth", onDepthClick, &depthContext);
 
 	ObjectDepthConfig depthCfg;
 	std::unordered_map<int, float> lastDistByClass;
@@ -585,10 +815,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 			return (it != lastDistByClass.end()) ? it->second : -1.0f;
 		}
 		auto it = lastDistByClass.find(cls);
-		if (it == lastDistByClass.end()) {
-			lastDistByClass[cls] = cur;
-			return cur;
-		}
+		if (it == lastDistByClass.end()) { lastDistByClass[cls] = cur; return cur; }
 		float last = it->second;
 		if (std::abs(cur - last) > depthCfg.max_jump_m) return last;
 		float filtered = (1.0f - depthCfg.filter_alpha) * last + depthCfg.filter_alpha * cur;
@@ -598,9 +825,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 
 	while (true) {
 		cv::Mat frame;
-		if (!capture.read(frame)) {
-			continue;
-		}
+		if (!capture.read(frame)) continue;
 
 		cv::Size combinedImageSize = frame.size();
 		cv::Mat leftImage = frame(cv::Rect(0, 0, combinedImageSize.width / 2, combinedImageSize.height));
@@ -615,13 +840,8 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		if (!mapsReady) {
 			cv::Mat R1, R2, P1, P2;
 			cv::Size imageSize = leftGray.size();
-			cv::stereoRectify(
-				cameraMatrixLeft, distCoeffsLeft,
-				cameraMatrixRight, distCoeffsRight,
-				imageSize, R, T,
-				R1, R2, P1, P2, Q,
-				cv::CALIB_ZERO_DISPARITY,
-				1, imageSize, &roi1, &roi2);
+			cv::stereoRectify(cameraMatrixLeft, distCoeffsLeft, cameraMatrixRight, distCoeffsRight,
+				imageSize, R, T, R1, R2, P1, P2, Q, cv::CALIB_ZERO_DISPARITY, 1, imageSize, &roi1, &roi2);
 			cv::initUndistortRectifyMap(cameraMatrixLeft, distCoeffsLeft, R1, P1, imageSize, CV_16SC2, mapLx, mapLy);
 			cv::initUndistortRectifyMap(cameraMatrixRight, distCoeffsRight, R2, P2, imageSize, CV_16SC2, mapRx, mapRy);
 			stereoBM->setROI1(roi1);
@@ -673,9 +893,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		cv::Mat depthMask = validMaskRaw & finiteMask & depthRangeMask;
 
 		cv::Mat depthNorm;
-		depthMeters.convertTo(
-			depthNorm, CV_32F,
-			1.0 / (depthVisMaxMeters - depthVisMinMeters),
+		depthMeters.convertTo(depthNorm, CV_32F, 1.0 / (depthVisMaxMeters - depthVisMinMeters),
 			-depthVisMinMeters / (depthVisMaxMeters - depthVisMinMeters));
 		cv::min(depthNorm, 1.0, depthNorm);
 		cv::max(depthNorm, 0.0, depthNorm);
@@ -686,7 +904,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		cv::applyColorMap(255 - depthVisGray, depthVis, cv::COLORMAP_TURBO);
 		depthVis.setTo(cv::Scalar(0, 0, 0), ~depthMask);
 
-		std::vector<YoloDetection> detections = detector.Detect(leftRectColor);
+		std::vector<YoloDetection> detections = detector->Detect(leftRectColor);
 		for (auto& det : detections) {
 			ObjectDepthResult depthResult = estimateObjectDepth(depthMeters, det.box, depthCfg);
 			det.distanceValid = depthResult.valid;
@@ -701,8 +919,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 				det.depthMeters = static_cast<double>(filteredDist);
 			} else {
 				float lastDist = filterDistance(det.classId, 0.0f, false);
-				det.depthMeters = (lastDist > 0) ? static_cast<double>(lastDist)
-					: std::numeric_limits<double>::quiet_NaN();
+				det.depthMeters = (lastDist > 0) ? static_cast<double>(lastDist) : std::numeric_limits<double>::quiet_NaN();
 			}
 
 			cv::Scalar color(80, 220, 255);
@@ -722,20 +939,16 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 			}
 			label += " v=" + cv::format("%.2f", det.validRatio);
 			label += " pk=" + cv::format("%.2f", det.peakRatio);
-			if (det.distanceValid) {
-				label += " s=" + cv::format("%.2f", det.stdM);
-			}
+			if (det.distanceValid) label += " s=" + cv::format("%.2f", det.stdM);
 
 			int baseline = 0;
 			double fontScale = 0.40;
 			int thickness = 1;
 			cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
 			int labelTop = std::max(0, det.box.y - labelSize.height - 8);
-			cv::rectangle(leftRectColor,
-				cv::Rect(det.box.x, labelTop, labelSize.width + 8, labelSize.height + 8),
+			cv::rectangle(leftRectColor, cv::Rect(det.box.x, labelTop, labelSize.width + 8, labelSize.height + 8),
 				cv::Scalar(20, 20, 20), cv::FILLED);
-			cv::putText(leftRectColor, label,
-				cv::Point(det.box.x + 4, labelTop + labelSize.height + 2),
+			cv::putText(leftRectColor, label, cv::Point(det.box.x + 4, labelTop + labelSize.height + 2),
 				cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255, 255, 255), thickness, cv::LINE_AA);
 
 			std::cout << "class=" << ClassName(det.classId)
@@ -752,28 +965,20 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 				<< "\n";
 		}
 
-		if (showLeft) {
-			cv::imshow("left", leftRectColor);
-		}
-		if (showRight) {
-			cv::imshow("right", rightRectColor);
-		}
-		if (showDepth) {
-			cv::imshow("depth", depthVis);
-		}
+		if (showLeft) cv::imshow("left", leftRectColor);
+		if (showRight) cv::imshow("right", rightRectColor);
+		if (showDepth) cv::imshow("depth", depthVis);
 		cv::imshow("yolo", leftRectColor);
 
 		int key = cv::waitKey(1);
-		if (key == 'Q' || key == 'q') {
-			break;
-		}
+		if (key == 'Q' || key == 'q') break;
 	}
 }
 
-#else  // !YOLO_USE_ONNXRUNTIME
+#else  // !(YOLO_USE_ONNXRUNTIME || YOLO_USE_TENSORRT)
 
 void yoloStereoMode(int, bool, bool, bool, bool, bool, bool, const std::string&) {
-	std::cerr << "YOLO mode not available: rebuild with ONNX Runtime installed.\n";
+	std::cerr << "YOLO mode not available: rebuild with ONNX Runtime or TensorRT installed.\n";
 }
 
-#endif  // YOLO_USE_ONNXRUNTIME
+#endif  // YOLO_USE_ONNXRUNTIME || YOLO_USE_TENSORRT
