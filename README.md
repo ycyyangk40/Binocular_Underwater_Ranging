@@ -33,21 +33,62 @@ cmake --build build --config Debug
 ```
 
 ## 运行
-```bash
-# 进入 build/Release 或 build/Debug 目录
-cd build/Release
 
-# CLI 用法: opencv_cli.exe [摄像头号] [模式] [选项]
-opencv_cli.exe 0 depth
-opencv_cli.exe 0 calib
-opencv_cli.exe 0 depth --fast --no-enhance --hide-disp
+### 快速开始 — 在 opencv 根目录终端，输入即跑
+
+**Debug 模式：**
+
+```bash
+# 深度测距（点击深度图可测距，按 Q 退出）
+./build/Debug/opencv_cli.exe 0 depth
+
+# 双目标定
+./build/Debug/opencv_cli.exe 0 calib
+
+# 极线校正验证
+./build/Debug/opencv_cli.exe 0 rectify
+
+# YOLO 目标检测 + 深度
+./build/Debug/opencv_cli.exe 0 yolo
+
+# 基础双目预览
+./build/Debug/opencv_cli.exe 0 video
+
+# 超声波串口测距
+./build/Debug/opencv_cli.exe 0 sonar --sonar-com COM3
 ```
 
-> **摄像头说明**: 双目拼接摄像头通常为设备 0（2560×720, 左右 1280×720 并排）。若不确定，先跑 `opencv_cli.exe 0` 看画面。
+**Release 模式：**
+
+```bash
+# 深度测距（点击深度图可测距，按 Q 退出）
+./build/Release/opencv_cli.exe 0 depth
+
+# 双目标定
+./build/Release/opencv_cli.exe 0 calib
+
+# 极线校正验证
+./build/Release/opencv_cli.exe 0 rectify
+
+# YOLO 目标检测 + 深度
+./build/Release/opencv_cli.exe 0 yolo
+
+# 基础双目预览
+./build/Release/opencv_cli.exe 0 video
+
+# 超声波串口测距
+./build/Release/opencv_cli.exe 0 sonar --sonar-com COM3
+```
+
+> **摄像头说明**: 双目拼接摄像头通常为设备 0（2560×720, 左右 1280×720 并排）。若不确定，先跑 `./build/Release/opencv_cli.exe 0 video` 看画面。所有 GUI 模式按 **Q** 退出。
 
 ### UI
 ```bash
-opencv_ui.exe
+# Debug
+./build/Debug/opencv_ui.exe
+
+# Release
+./build/Release/opencv_ui.exe
 ```
 
 ## CLI 模式
@@ -64,61 +105,63 @@ opencv_ui.exe
 
 ### 各模式测试命令
 
+> 以下示例用 Debug 路径，用 Release 时把 `Debug` 换成 `Release` 即可。
+
 **标定 (calib)** — 用棋盘格采集角点完成标定，生成 `data/*.yml`：
 ```bash
 # 默认 9×6 棋盘格，方格 2.97mm
-opencv_cli.exe 0 calib
+./build/Debug/opencv_cli.exe 0 calib
 
 # 自定义棋盘格参数
-opencv_cli.exe 0 calib --board-width 8 --board-height 5 --square-size 25.0
+./build/Debug/opencv_cli.exe 0 calib --board-width 8 --board-height 5 --square-size 25.0
 ```
 操作：每张图检测到角点后按 **Space** 保存，采集足够样本后按 **Enter** 开始计算，结果写入 `data/`。
 
 **深度 (depth)** — 实时视差+深度图，点击深度图测距：
 ```bash
 # 完整模式（4 窗口）
-opencv_cli.exe 0 depth
+./build/Debug/opencv_cli.exe 0 depth
 
 # 只显示深度图，快速模式
-opencv_cli.exe 0 depth --hide-left --hide-right --hide-disp --fast
+./build/Debug/opencv_cli.exe 0 depth --hide-left --hide-right --hide-disp --fast
 
 # 关掉水下增强
-opencv_cli.exe 0 depth --no-enhance
+./build/Debug/opencv_cli.exe 0 depth --no-enhance
 ```
 
 **视频预览 (video)** — 基础双目查看：
 ```bash
 # 默认双目预览（水下增强）
-opencv_cli.exe 0
+./build/Debug/opencv_cli.exe 0
 
 # 同效果，显式指定 mode
-opencv_cli.exe 0 video
+./build/Debug/opencv_cli.exe 0 video
 
 # 二值化预览
-opencv_cli.exe 0 binary
+./build/Debug/opencv_cli.exe 0 binary
 
 # 灰度模式
-opencv_cli.exe 0 video --gray
+./build/Debug/opencv_cli.exe 0 video --gray
 
 # 只看左目
-opencv_cli.exe 0 video --hide-right
+./build/Debug/opencv_cli.exe 0 video --hide-right
 ```
 
 **极线校正 (rectify)** — 检查标定质量：
 ```bash
-opencv_cli.exe 0 rectify
+./build/Debug/opencv_cli.exe 0 rectify
 ```
 
 **YOLO 检测 (yolo)** — 目标检测+深度：
 ```bash
-opencv_cli.exe 0 yolo
-opencv_cli.exe 0 yolo --model models/yolov8n.onnx --fast
+./build/Debug/opencv_cli.exe 0 yolo
+./build/Debug/opencv_cli.exe 0 yolo --model models/yolov8n.onnx --fast
 ```
 
 **超声波 (sonar)** — 串口传感器测距：
 ```bash
-opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-baud 115200 --sonar-addr 1
-opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-debug
+./build/Debug/opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-baud 115200 --sonar-addr 1
+./build/Debug/opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-debug
 ```
 
 > 所有 GUI 模式下按 **Q** 退出。
@@ -126,7 +169,7 @@ opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-debug
 ## CLI 参数速查
 
 ```
-opencv_cli.exe [摄像头号] [模式] [选项]
+./build/Debug/opencv_cli.exe [摄像头号] [模式] [选项]
 ```
 
 | 参数 | 说明 | 适用模式 |
