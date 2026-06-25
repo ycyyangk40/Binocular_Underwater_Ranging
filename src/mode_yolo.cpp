@@ -25,6 +25,33 @@
 #include <vector>
 
 namespace {
+
+enum class DepthMethod {
+	Invalid,
+	HistogramPeak,
+	TrimmedMedian
+};
+
+const char* DepthMethodName(DepthMethod m) {
+	switch (m) {
+		case DepthMethod::HistogramPeak: return "peak";
+		case DepthMethod::TrimmedMedian: return "median";
+		default: return "invalid";
+	}
+}
+
+struct HistogramPeakResult {
+	bool valid = false;
+
+	float peak_median_m = -1.0f;
+	float peak_mean_m = -1.0f;
+	float peak_std_m = -1.0f;
+
+	int peak_points = 0;
+	float peak_ratio = 0.0f;
+	int peak_bin_index = -1;
+};
+
 struct YoloDetection {
 	int classId = -1;
 	float confidence = 0.0f;
@@ -33,7 +60,9 @@ struct YoloDetection {
 	float depthConfidence = 0.0f;
 	bool distanceValid = false;
 	float validRatio = 0.0f;
+	float peakRatio = 0.0f;
 	float stdM = 0.0f;
+	std::string method = "?";
 };
 
 struct LetterboxInfo {
@@ -58,11 +87,15 @@ struct ObjectDepthConfig {
 	float max_jump_m = 0.50f;
 	float filter_alpha = 0.3f;
 	float hist_bin_width_m = 0.05f;
+	int min_peak_points = 15;
+	float min_peak_ratio = 0.25f;
+	float max_peak_std_m = 0.45f;
 };
 
 struct ObjectDepthResult {
 	bool valid = false;
 	float distance_m = -1.0f;
+	DepthMethod method = DepthMethod::Invalid;
 
 	float raw_median_m = -1.0f;
 	float raw_mean_m = -1.0f;
@@ -71,6 +104,10 @@ struct ObjectDepthResult {
 	float valid_ratio = 0.0f;
 	int valid_points = 0;
 	int total_points = 0;
+
+	float peak_ratio = 0.0f;
+	int peak_points = 0;
+	float peak_std_m = -1.0f;
 
 	float depth_confidence = 0.0f;
 
@@ -122,6 +159,68 @@ cv::Rect shrinkBox(const cv::Rect& box, float scale, const cv::Size& imageSize) 
 	return inner & cv::Rect(0, 0, imageSize.width, imageSize.height);
 }
 
+HistogramPeakResult findHistogramPeak(const std::vector<float>& values, float binWidthM) {
+	HistogramPeakResult r;
+	if (values.empty()) return r;
+
+	float zMin = *std::min_element(values.begin(), values.end());
+	float zMax = *std::max_element(values.begin(), values.end());
+
+	if (zMax - zMin < binWidthM) {
+		size_t mid = values.size() / 2;
+		std::vector<float> sorted = values;
+		std::nth_element(sorted.begin(), sorted.begin() + mid, sorted.end());
+		r.valid = true;
+		r.peak_median_m = sorted[mid];
+		r.peak_points = static_cast<int>(values.size());
+		r.peak_ratio = 1.0f;
+		r.peak_bin_index = 0;
+		return r;
+	}
+
+	int nBins = std::max(1, static_cast<int>((zMax - zMin) / binWidthM + 0.5f));
+	std::vector<int> bins(nBins, 0);
+	for (float z : values) {
+		int idx = static_cast<int>((z - zMin) / binWidthM);
+		if (idx < 0) idx = 0;
+		if (idx >= nBins) idx = nBins - 1;
+		bins[idx]++;
+	}
+
+	int peakIdx = 0;
+	for (int i = 1; i < nBins; ++i) {
+		if (bins[i] > bins[peakIdx]) peakIdx = i;
+	}
+	r.peak_bin_index = peakIdx;
+
+	float lo = zMin + (peakIdx - 1.5f) * binWidthM;
+	float hi = zMin + (peakIdx + 2.5f) * binWidthM;
+
+	std::vector<float> peakVals;
+	for (float z : values) {
+		if (z >= lo && z <= hi) peakVals.push_back(z);
+	}
+
+	r.peak_points = static_cast<int>(peakVals.size());
+	r.peak_ratio = static_cast<float>(peakVals.size()) / static_cast<float>(values.size());
+
+	if (peakVals.empty()) return r;
+
+	std::sort(peakVals.begin(), peakVals.end());
+	int m = static_cast<int>(peakVals.size());
+	r.peak_median_m = peakVals[m / 2];
+
+	double sum = 0.0, sumSq = 0.0;
+	for (float v : peakVals) { sum += v; sumSq += static_cast<double>(v) * v; }
+	r.peak_mean_m = static_cast<float>(sum / m);
+	float meanSq = static_cast<float>(sumSq / m);
+	float var = meanSq - r.peak_mean_m * r.peak_mean_m;
+	r.peak_std_m = (var > 0) ? std::sqrt(var) : 0.0f;
+
+	r.valid = true;
+	return r;
+}
+
 ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect& bbox,
                                       const ObjectDepthConfig& cfg) {
 	ObjectDepthResult r;
@@ -151,6 +250,7 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 
 	if (r.valid_points < cfg.min_valid_points || r.valid_ratio < cfg.min_valid_ratio) return r;
 
+	// Primary: trimmed median (proven robust)
 	std::sort(values.begin(), values.end());
 	int n = static_cast<int>(values.size());
 	int left = static_cast<int>(n * cfg.trim_ratio);
@@ -170,7 +270,18 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 	r.std_m = (var > 0) ? std::sqrt(var) : 0.0f;
 	r.raw_median_m = values[left + cnt / 2];
 
+	r.method = DepthMethod::TrimmedMedian;
 	r.distance_m = r.raw_median_m;
+
+	// Secondary: histogram peak (for debug / future upgrade)
+	HistogramPeakResult peak = findHistogramPeak(values, cfg.hist_bin_width_m);
+	bool peakOk = peak.valid
+		&& peak.peak_points >= cfg.min_peak_points
+		&& peak.peak_ratio >= cfg.min_peak_ratio
+		&& peak.peak_std_m <= cfg.max_peak_std_m;
+	r.peak_ratio = peak.valid ? peak.peak_ratio : 0.0f;
+	r.peak_points = peak.valid ? peak.peak_points : 0;
+	r.peak_std_m = peak.valid ? peak.peak_std_m : -1.0f;
 
 	float conf = 1.0f;
 	if (r.valid_ratio < 0.25f) conf *= 0.3f;
@@ -181,38 +292,6 @@ ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect
 
 	r.valid = (r.std_m <= cfg.max_std_m);
 	return r;
-}
-
-float estimateDepthByHistogramPeak(const std::vector<float>& values, float binWidthM) {
-	if (values.empty()) return -1.0f;
-	float zMin = *std::min_element(values.begin(), values.end());
-	float zMax = *std::max_element(values.begin(), values.end());
-	if (zMax - zMin < binWidthM) {
-		size_t mid = values.size() / 2;
-		return values[mid];
-	}
-	int nBins = std::max(1, static_cast<int>((zMax - zMin) / binWidthM + 0.5f));
-	std::vector<int> bins(nBins, 0);
-	for (float z : values) {
-		int idx = static_cast<int>((z - zMin) / binWidthM);
-		if (idx < 0) idx = 0;
-		if (idx >= nBins) idx = nBins - 1;
-		bins[idx]++;
-	}
-	int peakIdx = 0;
-	for (int i = 1; i < nBins; ++i) {
-		if (bins[i] > bins[peakIdx]) peakIdx = i;
-	}
-	float lo = zMin + (peakIdx - 0.5f) * binWidthM;
-	float hi = zMin + (peakIdx + 1.5f) * binWidthM;
-	std::vector<float> peakVals;
-	for (float z : values) {
-		if (z >= lo && z <= hi) peakVals.push_back(z);
-	}
-	if (peakVals.empty()) return values[values.size() / 2];
-	size_t mid = peakVals.size() / 2;
-	std::nth_element(peakVals.begin(), peakVals.begin() + mid, peakVals.end());
-	return peakVals[mid];
 }
 
 class YoloDetector {
@@ -576,6 +655,23 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		depthContext.depthMeters = depthMeters;
 		depthContext.validMask = validMaskRaw;
 
+		{
+			static bool printedOnce = false;
+			if (!printedOnce) {
+				printedOnce = true;
+				std::cout << "[DEBUG] left_rect  size = " << leftRectColor.cols << "x" << leftRectColor.rows << std::endl;
+				std::cout << "[DEBUG] right_rect size = " << rightRectColor.cols << "x" << rightRectColor.rows << std::endl;
+				std::cout << "[DEBUG] depth_map  size = " << depthMeters.cols << "x" << depthMeters.rows << std::endl;
+			}
+		}
+
+		if (leftRectColor.size() != depthMeters.size()) {
+			std::cerr << "[ERROR] left_rect size " << leftRectColor.cols << "x" << leftRectColor.rows
+			          << " != depth_map size " << depthMeters.cols << "x" << depthMeters.rows
+			          << " — coordinate mismatch!" << std::endl;
+			return;
+		}
+
 		cv::Mat finiteMask = (depthMeters == depthMeters);
 		cv::Mat depthRangeMask = (depthMeters >= depthVisMinMeters) & (depthMeters <= depthVisMaxMeters);
 		cv::Mat depthMask = validMaskRaw & finiteMask & depthRangeMask;
@@ -600,7 +696,9 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 			det.distanceValid = depthResult.valid;
 			det.depthConfidence = depthResult.depth_confidence;
 			det.validRatio = depthResult.valid_ratio;
+			det.peakRatio = depthResult.peak_ratio;
 			det.stdM = depthResult.std_m;
+			det.method = DepthMethodName(depthResult.method);
 
 			if (depthResult.valid) {
 				float filteredDist = filterDistance(det.classId, depthResult.distance_m, true);
@@ -613,24 +711,27 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 
 			cv::Scalar color(80, 220, 255);
 			cv::rectangle(leftRectColor, det.box, color, 2);
+			cv::rectangle(depthVis, det.box, color, 2);
 			if (!depthResult.inner_roi.empty()) {
 				cv::rectangle(leftRectColor, depthResult.inner_roi, cv::Scalar(0, 255, 255), 1);
+				cv::rectangle(depthVis, depthResult.inner_roi, cv::Scalar(0, 255, 255), 1);
 			}
 
 			std::string label = ClassName(det.classId) + " " + cv::format("%.2f", det.confidence);
 			if (std::isfinite(det.depthMeters)) {
 				label += " Z=" + cv::format("%.2fm", det.depthMeters);
-				label += " Dc=" + cv::format("%.2f", det.depthConfidence);
+				label += " " + det.method;
 			} else {
 				label += " Z=invalid";
 			}
 			label += " v=" + cv::format("%.2f", det.validRatio);
+			label += " pk=" + cv::format("%.2f", det.peakRatio);
 			if (det.distanceValid) {
 				label += " s=" + cv::format("%.2f", det.stdM);
 			}
 
 			int baseline = 0;
-			double fontScale = 0.45;
+			double fontScale = 0.40;
 			int thickness = 1;
 			cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
 			int labelTop = std::max(0, det.box.y - labelSize.height - 8);
@@ -644,10 +745,12 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 			std::cout << "class=" << ClassName(det.classId)
 				<< " yolo_conf=" << det.confidence
 				<< " distance=" << (std::isfinite(det.depthMeters) ? cv::format("%.2f", det.depthMeters) : "invalid")
+				<< " method=" << det.method
 				<< " valid_ratio=" << depthResult.valid_ratio
 				<< " valid_points=" << depthResult.valid_points
+				<< " peak_ratio=" << depthResult.peak_ratio
+				<< " peak_points=" << depthResult.peak_points
 				<< " median=" << depthResult.raw_median_m
-				<< " mean=" << depthResult.raw_mean_m
 				<< " std=" << depthResult.std_m
 				<< " depth_conf=" << depthResult.depth_confidence
 				<< "\n";

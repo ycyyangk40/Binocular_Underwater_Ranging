@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
 	bool hasShowFlags = false;
 	std::string view = "both";
 	std::string mode = "depth";
-	std::string modelPath = "models/yolov8l.onnx";
+	std::string modelPath = "models/yolov8n.onnx";
 	int boardHeight = 6;
 	int boardWidth = 9;
 	float squareSize = 2.97f;
