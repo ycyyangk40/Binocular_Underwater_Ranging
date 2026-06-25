@@ -64,8 +64,10 @@ add_executable(opencv_cli
 	src/mode_calib.cpp
 	src/mode_depth.cpp
 	src/mode_rectify.cpp
+	src/mode_sonar.cpp
 	src/mode_yolo.cpp
 	src/mode_video.cpp
+	src/sonar_reader.cpp
 )
 
 target_include_directories(opencv_cli PRIVATE src)

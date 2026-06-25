@@ -324,7 +324,7 @@ void WebViewApp::StartCliProcess(const std::wstring& mode, const std::wstring& v
 	PathRemoveFileSpecW(workDir);
 	PathRemoveFileSpecW(workDir);
 
-	std::wstring cmd = L"\"" + exePath + L"\" 0 " + mode;
+	std::wstring cmd = L"\"" + exePath + L"\" 1 " + mode;
 	if (!view.empty() && view != L"both") {
 		cmd += L" --view " + view;
 	}
@@ -393,7 +393,7 @@ void WebViewApp::StartCliProcess(const std::wstring& mode, const std::wstring& v
 		if (webview_) {
 			webview_->PostWebMessageAsString(L"status:running");
 		}
-		if (mode == L"calib" || mode == L"depth") {
+		if (mode == L"calib" || mode == L"depth" || mode == L"yolo") {
 			StartLogTail(logPath);
 		}
 	} else if (webview_) {

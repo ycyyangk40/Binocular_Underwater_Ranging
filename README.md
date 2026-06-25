@@ -33,10 +33,17 @@ cmake --build build --config Debug
 ```
 
 ## 运行
-### CLI
 ```bash
+# 进入 build/Release 或 build/Debug 目录
+cd build/Release
+
+# CLI 用法: opencv_cli.exe [摄像头号] [模式] [选项]
 opencv_cli.exe 0 depth
+opencv_cli.exe 0 calib
+opencv_cli.exe 0 depth --fast --no-enhance --hide-disp
 ```
+
+> **摄像头说明**: 双目拼接摄像头通常为设备 0（2560×720, 左右 1280×720 并排）。若不确定，先跑 `opencv_cli.exe 0` 看画面。
 
 ### UI
 ```bash
@@ -44,30 +51,104 @@ opencv_ui.exe
 ```
 
 ## CLI 模式
-- `calib`: 交互式双目标定
-- `rectify`: 显示极线校正后的双目画面
-- `depth`: 计算视差与深度图
-- `yolo`: YOLO 检测并融合深度信息 (需要 ONNX Runtime)
-- `video`: 基础双目预览 (默认)
 
-## CLI 参数
-用法: `opencv_cli.exe [camera] [mode] [options]`
+| 模式 | 用途 | 需要标定文件 | 窗口 / 交互 |
+|------|------|:---:|---|
+| `calib` | 交互式双目标定（棋盘格角点检测 → 保存内参+外参） | — | left, right, left_valid, right_valid |
+| `rectify` | 极线校正预览，叠加水平参考线验证标定质量 | ✅ | left, right（灰度矫正后画面） |
+| `depth` | 视差图 + 深度伪彩图，点击深度图测距 | ✅ | left, right, disp, depth |
+| `yolo` | YOLOv8 目标检测 + 深度融合（需 ONNX Runtime） | ✅ | left, right, depth |
+| `video` | 基础双目预览，不做矫正/深度（默认模式） | — | left, right |
+| `sonar` | 串口超声波测距模块实时读数 | — | 终端输出 |
+| `binary` | 等同 `video --binary`（二值化预览） | — | left, right |
 
-参数:
-- `--mode <name>`
-- `--view left|right|both`
-- `--binary`
-- `--fast`
-- `--gray`
-- `--no-enhance`
-- `--show-left` | `--hide-left`
-- `--show-right` | `--hide-right`
-- `--show-disp` | `--hide-disp`
-- `--show-depth` | `--hide-depth`
-- `--model <path>`
-- `--board-height <n>`
-- `--board-width <n>`
-- `--square-size <meters>`
+### 各模式测试命令
+
+**标定 (calib)** — 用棋盘格采集角点完成标定，生成 `data/*.yml`：
+```bash
+# 默认 9×6 棋盘格，方格 2.97mm
+opencv_cli.exe 0 calib
+
+# 自定义棋盘格参数
+opencv_cli.exe 0 calib --board-width 8 --board-height 5 --square-size 25.0
+```
+操作：每张图检测到角点后按 **Space** 保存，采集足够样本后按 **Enter** 开始计算，结果写入 `data/`。
+
+**深度 (depth)** — 实时视差+深度图，点击深度图测距：
+```bash
+# 完整模式（4 窗口）
+opencv_cli.exe 0 depth
+
+# 只显示深度图，快速模式
+opencv_cli.exe 0 depth --hide-left --hide-right --hide-disp --fast
+
+# 关掉水下增强
+opencv_cli.exe 0 depth --no-enhance
+```
+
+**视频预览 (video)** — 基础双目查看：
+```bash
+# 默认双目预览（水下增强）
+opencv_cli.exe 0
+
+# 同效果，显式指定 mode
+opencv_cli.exe 0 video
+
+# 二值化预览
+opencv_cli.exe 0 binary
+
+# 灰度模式
+opencv_cli.exe 0 video --gray
+
+# 只看左目
+opencv_cli.exe 0 video --hide-right
+```
+
+**极线校正 (rectify)** — 检查标定质量：
+```bash
+opencv_cli.exe 0 rectify
+```
+
+**YOLO 检测 (yolo)** — 目标检测+深度：
+```bash
+opencv_cli.exe 0 yolo
+opencv_cli.exe 0 yolo --model models/yolov8n.onnx --fast
+```
+
+**超声波 (sonar)** — 串口传感器测距：
+```bash
+opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-baud 115200 --sonar-addr 1
+opencv_cli.exe 0 sonar --sonar-com COM3 --sonar-debug
+```
+
+> 所有 GUI 模式下按 **Q** 退出。
+
+## CLI 参数速查
+
+```
+opencv_cli.exe [摄像头号] [模式] [选项]
+```
+
+| 参数 | 说明 | 适用模式 |
+|------|------|----------|
+| `--mode <name>` | 覆盖模式（同第二个位置参数） | 所有 |
+| `--view left\|right\|both` | 快捷切换单目/双目显示 | depth, yolo, video |
+| `--binary` | 二值化预览 | video |
+| `--fast` | 快速模式（降低视差精度换速度） | depth, yolo |
+| `--gray` | 灰度显示 | depth, yolo, video |
+| `--no-enhance` | 关闭水下增强 | depth, yolo, video |
+| `--show-left` `--hide-left` | 显示/隐藏左目窗口 | depth, yolo, video |
+| `--show-right` `--hide-right` | 显示/隐藏右目窗口 | depth, yolo, video |
+| `--show-disp` `--hide-disp` | 显示/隐藏视差图窗口 | depth |
+| `--show-depth` `--hide-depth` | 显示/隐藏深度图窗口 | depth, yolo |
+| `--model <path>` | YOLO 模型路径 (默认 `models/yolov8l.onnx`) | yolo |
+| `--board-height <n>` | 棋盘格行数 (默认 6) | calib |
+| `--board-width <n>` | 棋盘格列数 (默认 9) | calib |
+| `--square-size <mm>` | 棋盘格方格尺寸 (默认 2.97) | calib |
+| `--sonar-com <port>` | 串口号 (如 COM3) | sonar |
+| `--sonar-baud <rate>` | 波特率 (默认 115200) | sonar |
+| `--sonar-addr <n>` | 从机地址 (默认 1) | sonar |
+| `--sonar-debug` | 开启串口调试输出 | sonar |
 
 ## 标定输出
 标定数据保存在 `data/` 下:

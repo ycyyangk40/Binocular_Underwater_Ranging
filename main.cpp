@@ -7,11 +7,12 @@
 #include "src/mode_calib.hpp"
 #include "src/mode_depth.hpp"
 #include "src/mode_rectify.hpp"
+#include "src/mode_sonar.hpp"
 #include "src/mode_yolo.hpp"
 #include "src/mode_video.hpp"
 
 int main(int argc, char** argv) {
-	int cameraDeviceNo = 0;
+	int cameraDeviceNo = 1;
 	bool useBinaryThreshold = false;
 	bool fastMode = false;
 	bool showGray = false;
@@ -20,6 +21,7 @@ int main(int argc, char** argv) {
 	bool showRight = true;
 	bool showDisp = true;
 	bool showDepth = true;
+	bool sonarDebug = false;
 	bool hasShowFlags = false;
 	std::string view = "both";
 	std::string mode = "depth";
@@ -27,6 +29,9 @@ int main(int argc, char** argv) {
 	int boardHeight = 6;
 	int boardWidth = 9;
 	float squareSize = 2.97f;
+	std::string sonarCom;
+	int sonarBaud = 115200;
+	int sonarAddr = 1;
 
 	int argi = 1;
 	if (argi < argc && argv[argi][0] != '-') {
@@ -84,6 +89,14 @@ int main(int argc, char** argv) {
 			boardWidth = std::atoi(argv[++i]);
 		} else if (arg == "--square-size" && i + 1 < argc) {
 			squareSize = static_cast<float>(std::atof(argv[++i]));
+		} else if (arg == "--sonar-com" && i + 1 < argc) {
+			sonarCom = argv[++i];
+		} else if (arg == "--sonar-baud" && i + 1 < argc) {
+			sonarBaud = std::atoi(argv[++i]);
+		} else if (arg == "--sonar-addr" && i + 1 < argc) {
+			sonarAddr = std::atoi(argv[++i]);
+		} else if (arg == "--sonar-debug") {
+			sonarDebug = true;
 		}
 	}
 
@@ -103,6 +116,12 @@ int main(int argc, char** argv) {
 	try {
 		if (mode == "calib") {
 			InteractiveCalib(cv::Size(boardWidth, boardHeight), squareSize);
+		} else if (mode == "sonar") {
+			if (sonarCom.empty()) {
+				std::cerr << "Error: --sonar-com is required for sonar mode\n";
+				return 1;
+			}
+			return runSonarTest(sonarCom, sonarBaud, sonarAddr, sonarDebug);
 		} else if (mode == "rectify") {
 			stereoRectifyMode(cameraDeviceNo);
 		} else if (mode == "depth") {

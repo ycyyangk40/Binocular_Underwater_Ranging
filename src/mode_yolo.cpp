@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,10 @@ struct YoloDetection {
 	float confidence = 0.0f;
 	cv::Rect box;
 	double depthMeters = std::numeric_limits<double>::quiet_NaN();
+	float depthConfidence = 0.0f;
+	bool distanceValid = false;
+	float validRatio = 0.0f;
+	float stdM = 0.0f;
 };
 
 struct LetterboxInfo {
@@ -40,6 +45,36 @@ struct LetterboxInfo {
 struct DepthContext {
 	cv::Mat depthMeters;
 	cv::Mat validMask;
+};
+
+struct ObjectDepthConfig {
+	float inner_roi_scale = 0.75f;
+	float min_depth_m = 0.15f;
+	float max_depth_m = 5.0f;
+	float trim_ratio = 0.2f;
+	int min_valid_points = 15;
+	float min_valid_ratio = 0.10f;
+	float max_std_m = 0.45f;
+	float max_jump_m = 0.50f;
+	float filter_alpha = 0.3f;
+	float hist_bin_width_m = 0.05f;
+};
+
+struct ObjectDepthResult {
+	bool valid = false;
+	float distance_m = -1.0f;
+
+	float raw_median_m = -1.0f;
+	float raw_mean_m = -1.0f;
+	float std_m = -1.0f;
+
+	float valid_ratio = 0.0f;
+	int valid_points = 0;
+	int total_points = 0;
+
+	float depth_confidence = 0.0f;
+
+	cv::Rect inner_roi;
 };
 
 static const std::array<const char*, 80> kCocoClasses = {
@@ -76,44 +111,108 @@ cv::Mat Letterbox(const cv::Mat& image, const cv::Size& targetSize, LetterboxInf
 	return output;
 }
 
-double MedianDepthInBox(const cv::Mat& depthMeters, const cv::Mat& validMask, const cv::Rect& box) {
-	if (depthMeters.empty() || box.width <= 0 || box.height <= 0) {
-		return std::numeric_limits<double>::quiet_NaN();
-	}
-	cv::Rect bounds(0, 0, depthMeters.cols, depthMeters.rows);
-	cv::Rect roi = box & bounds;
-	if (roi.empty()) {
-		return std::numeric_limits<double>::quiet_NaN();
-	}
-	int shrinkX = std::max(1, roi.width / 8);
-	int shrinkY = std::max(1, roi.height / 8);
-	roi.x += shrinkX;
-	roi.y += shrinkY;
-	roi.width -= shrinkX * 2;
-	roi.height -= shrinkY * 2;
-	roi &= bounds;
-	if (roi.empty()) {
-		return std::numeric_limits<double>::quiet_NaN();
-	}
+cv::Rect shrinkBox(const cv::Rect& box, float scale, const cv::Size& imageSize) {
+	float cx = box.x + box.width * 0.5f;
+	float cy = box.y + box.height * 0.5f;
+	int newW = static_cast<int>(box.width * scale);
+	int newH = static_cast<int>(box.height * scale);
+	int x = static_cast<int>(cx - newW * 0.5f);
+	int y = static_cast<int>(cy - newH * 0.5f);
+	cv::Rect inner(x, y, newW, newH);
+	return inner & cv::Rect(0, 0, imageSize.width, imageSize.height);
+}
 
-	std::vector<float> samples;
-	samples.reserve(static_cast<size_t>(roi.area()));
-	for (int y = roi.y; y < roi.y + roi.height; ++y) {
-		for (int x = roi.x; x < roi.x + roi.width; ++x) {
-			if (!validMask.empty() && validMask.at<uchar>(y, x) == 0) {
-				continue;
-			}
-			float depth = depthMeters.at<float>(y, x);
-			if (std::isfinite(depth) && depth > 1e-4f) {
-				samples.push_back(depth);
+ObjectDepthResult estimateObjectDepth(const cv::Mat& depthMeters, const cv::Rect& bbox,
+                                      const ObjectDepthConfig& cfg) {
+	ObjectDepthResult r;
+	if (depthMeters.empty() || bbox.width <= 0 || bbox.height <= 0) return r;
+
+	cv::Size imageSize(depthMeters.cols, depthMeters.rows);
+	r.inner_roi = shrinkBox(bbox, cfg.inner_roi_scale, imageSize);
+	if (r.inner_roi.empty()) return r;
+
+	r.total_points = r.inner_roi.area();
+	std::vector<float> values;
+	values.reserve(static_cast<size_t>(r.total_points));
+
+	for (int y = r.inner_roi.y; y < r.inner_roi.y + r.inner_roi.height; ++y) {
+		const float* row = depthMeters.ptr<float>(y);
+		for (int x = r.inner_roi.x; x < r.inner_roi.x + r.inner_roi.width; ++x) {
+			float z = row[x];
+			if (std::isfinite(z) && z > cfg.min_depth_m && z < cfg.max_depth_m) {
+				values.push_back(z);
 			}
 		}
 	}
-	if (samples.size() < 12) {
-		return std::numeric_limits<double>::quiet_NaN();
+
+	r.valid_points = static_cast<int>(values.size());
+	r.valid_ratio = (r.total_points > 0)
+		? static_cast<float>(values.size()) / static_cast<float>(r.total_points) : 0.0f;
+
+	if (r.valid_points < cfg.min_valid_points || r.valid_ratio < cfg.min_valid_ratio) return r;
+
+	std::sort(values.begin(), values.end());
+	int n = static_cast<int>(values.size());
+	int left = static_cast<int>(n * cfg.trim_ratio);
+	int right = static_cast<int>(n * (1.0f - cfg.trim_ratio));
+	if (right <= left) return r;
+
+	double sum = 0.0, sumSq = 0.0;
+	for (int i = left; i < right; ++i) {
+		float v = values[i];
+		sum += v;
+		sumSq += static_cast<double>(v) * v;
 	}
-	std::nth_element(samples.begin(), samples.begin() + samples.size() / 2, samples.end());
-	return static_cast<double>(samples[samples.size() / 2]);
+	int cnt = right - left;
+	r.raw_mean_m = static_cast<float>(sum / cnt);
+	float meanSq = static_cast<float>(sumSq / cnt);
+	float var = meanSq - r.raw_mean_m * r.raw_mean_m;
+	r.std_m = (var > 0) ? std::sqrt(var) : 0.0f;
+	r.raw_median_m = values[left + cnt / 2];
+
+	r.distance_m = r.raw_median_m;
+
+	float conf = 1.0f;
+	if (r.valid_ratio < 0.25f) conf *= 0.3f;
+	else if (r.valid_ratio < 0.5f) conf *= 0.7f;
+	if (r.std_m > 0.45f) conf *= 0.3f;
+	else if (r.std_m > 0.25f) conf *= 0.7f;
+	r.depth_confidence = std::clamp(conf, 0.0f, 1.0f);
+
+	r.valid = (r.std_m <= cfg.max_std_m);
+	return r;
+}
+
+float estimateDepthByHistogramPeak(const std::vector<float>& values, float binWidthM) {
+	if (values.empty()) return -1.0f;
+	float zMin = *std::min_element(values.begin(), values.end());
+	float zMax = *std::max_element(values.begin(), values.end());
+	if (zMax - zMin < binWidthM) {
+		size_t mid = values.size() / 2;
+		return values[mid];
+	}
+	int nBins = std::max(1, static_cast<int>((zMax - zMin) / binWidthM + 0.5f));
+	std::vector<int> bins(nBins, 0);
+	for (float z : values) {
+		int idx = static_cast<int>((z - zMin) / binWidthM);
+		if (idx < 0) idx = 0;
+		if (idx >= nBins) idx = nBins - 1;
+		bins[idx]++;
+	}
+	int peakIdx = 0;
+	for (int i = 1; i < nBins; ++i) {
+		if (bins[i] > bins[peakIdx]) peakIdx = i;
+	}
+	float lo = zMin + (peakIdx - 0.5f) * binWidthM;
+	float hi = zMin + (peakIdx + 1.5f) * binWidthM;
+	std::vector<float> peakVals;
+	for (float z : values) {
+		if (z >= lo && z <= hi) peakVals.push_back(z);
+	}
+	if (peakVals.empty()) return values[values.size() / 2];
+	size_t mid = peakVals.size() / 2;
+	std::nth_element(peakVals.begin(), peakVals.begin() + mid, peakVals.end());
+	return peakVals[mid];
 }
 
 class YoloDetector {
@@ -132,14 +231,15 @@ public:
 		try {
 			Ort::CUDAProviderOptions cudaOptions;
 			cudaOptions.Update({{"device_id", "0"}});
-			sessionOptions.AppendExecutionProvider_CUDA_V2(cudaOptions);
+			sessionOptions.AppendExecutionProvider_CUDA_V2(*cudaOptions);
 			std::cout << "ONNX Runtime CUDA provider enabled.\n";
 		} catch (const std::exception& ex) {
 			std::cout << "CUDA provider unavailable, falling back to CPU: " << ex.what() << "\n";
 		}
 #endif
 
-		session_ = std::make_unique<Ort::Session>(env_, modelPath.c_str(), sessionOptions);
+		std::wstring modelPathW = std::filesystem::path(modelPath).wstring();
+			session_ = std::make_unique<Ort::Session>(env_, modelPathW.c_str(), sessionOptions);
 
 		Ort::AllocatorWithDefaultOptions allocator;
 		for (size_t i = 0; i < session_->GetInputCount(); ++i) {
@@ -283,11 +383,8 @@ void onDepthClick(int event, int x, int y, int, void* userdata) {
 	std::vector<float> samples;
 	for (int yy = y0; yy <= y1; ++yy) {
 		for (int xx = x0; xx <= x1; ++xx) {
-			if (!ctx->validMask.empty() && ctx->validMask.at<uchar>(yy, xx) == 0) {
-				continue;
-			}
 			float depth = ctx->depthMeters.at<float>(yy, xx);
-			if (std::isfinite(depth) && depth > 1e-4f) {
+			if (std::isfinite(depth) && depth > 0.08f && depth < 5.0f) {
 				samples.push_back(depth);
 			}
 		}
@@ -383,9 +480,6 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 	cv::Rect roi1, roi2;
 	cv::Mat mapLx, mapLy, mapRx, mapRy;
 	cv::Mat Q;
-	cv::Mat disp32fFiltered;
-	bool hasFilteredDisp = false;
-	const float temporalAlpha = 0.2f;
 	const float depthVisMinMeters = 0.08f;
 	const float depthVisMaxMeters = 3.0f;
 
@@ -406,6 +500,26 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 	if (showDepth) {
 		cv::setMouseCallback("depth", onDepthClick, &depthContext);
 	}
+
+	ObjectDepthConfig depthCfg;
+	std::unordered_map<int, float> lastDistByClass;
+
+	auto filterDistance = [&](int cls, float cur, bool valid) -> float {
+		if (!valid) {
+			auto it = lastDistByClass.find(cls);
+			return (it != lastDistByClass.end()) ? it->second : -1.0f;
+		}
+		auto it = lastDistByClass.find(cls);
+		if (it == lastDistByClass.end()) {
+			lastDistByClass[cls] = cur;
+			return cur;
+		}
+		float last = it->second;
+		if (std::abs(cur - last) > depthCfg.max_jump_m) return last;
+		float filtered = (1.0f - depthCfg.filter_alpha) * last + depthCfg.filter_alpha * cur;
+		lastDistByClass[cls] = filtered;
+		return filtered;
+	};
 
 	while (true) {
 		cv::Mat frame;
@@ -452,15 +566,9 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 		stereoBM->compute(leftRectGray, rightRectGray, disp16);
 		disp16.convertTo(disp32f, CV_32F, 1.0 / 16.0);
 		cv::Mat validMaskRaw = disp32f > 0;
-		if (!hasFilteredDisp) {
-			disp32fFiltered = disp32f.clone();
-			hasFilteredDisp = true;
-		} else {
-			cv::addWeighted(disp32fFiltered, 1.0 - temporalAlpha, disp32f, temporalAlpha, 0.0, disp32fFiltered);
-		}
 
 		cv::Mat points3d;
-		cv::reprojectImageTo3D(disp32fFiltered, points3d, Q, true);
+		cv::reprojectImageTo3D(disp32f, points3d, Q, true);
 		std::vector<cv::Mat> channels;
 		cv::split(points3d, channels);
 		cv::Mat depth = channels[2];
@@ -488,18 +596,61 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 
 		std::vector<YoloDetection> detections = detector.Detect(leftRectColor);
 		for (auto& det : detections) {
-			det.depthMeters = MedianDepthInBox(depthMeters, validMaskRaw, det.box);
+			ObjectDepthResult depthResult = estimateObjectDepth(depthMeters, det.box, depthCfg);
+			det.distanceValid = depthResult.valid;
+			det.depthConfidence = depthResult.depth_confidence;
+			det.validRatio = depthResult.valid_ratio;
+			det.stdM = depthResult.std_m;
+
+			if (depthResult.valid) {
+				float filteredDist = filterDistance(det.classId, depthResult.distance_m, true);
+				det.depthMeters = static_cast<double>(filteredDist);
+			} else {
+				float lastDist = filterDistance(det.classId, 0.0f, false);
+				det.depthMeters = (lastDist > 0) ? static_cast<double>(lastDist)
+					: std::numeric_limits<double>::quiet_NaN();
+			}
+
 			cv::Scalar color(80, 220, 255);
 			cv::rectangle(leftRectColor, det.box, color, 2);
+			if (!depthResult.inner_roi.empty()) {
+				cv::rectangle(leftRectColor, depthResult.inner_roi, cv::Scalar(0, 255, 255), 1);
+			}
+
 			std::string label = ClassName(det.classId) + " " + cv::format("%.2f", det.confidence);
 			if (std::isfinite(det.depthMeters)) {
-				label += " " + cv::format("%.2fm", det.depthMeters);
+				label += " Z=" + cv::format("%.2fm", det.depthMeters);
+				label += " Dc=" + cv::format("%.2f", det.depthConfidence);
+			} else {
+				label += " Z=invalid";
 			}
+			label += " v=" + cv::format("%.2f", det.validRatio);
+			if (det.distanceValid) {
+				label += " s=" + cv::format("%.2f", det.stdM);
+			}
+
 			int baseline = 0;
-			cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.55, 1, &baseline);
+			double fontScale = 0.45;
+			int thickness = 1;
+			cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
 			int labelTop = std::max(0, det.box.y - labelSize.height - 8);
-			cv::rectangle(leftRectColor, cv::Rect(det.box.x, labelTop, labelSize.width + 8, labelSize.height + 8), cv::Scalar(20, 20, 20), cv::FILLED);
-			cv::putText(leftRectColor, label, cv::Point(det.box.x + 4, labelTop + labelSize.height + 2), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+			cv::rectangle(leftRectColor,
+				cv::Rect(det.box.x, labelTop, labelSize.width + 8, labelSize.height + 8),
+				cv::Scalar(20, 20, 20), cv::FILLED);
+			cv::putText(leftRectColor, label,
+				cv::Point(det.box.x + 4, labelTop + labelSize.height + 2),
+				cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(255, 255, 255), thickness, cv::LINE_AA);
+
+			std::cout << "class=" << ClassName(det.classId)
+				<< " yolo_conf=" << det.confidence
+				<< " distance=" << (std::isfinite(det.depthMeters) ? cv::format("%.2f", det.depthMeters) : "invalid")
+				<< " valid_ratio=" << depthResult.valid_ratio
+				<< " valid_points=" << depthResult.valid_points
+				<< " median=" << depthResult.raw_median_m
+				<< " mean=" << depthResult.raw_mean_m
+				<< " std=" << depthResult.std_m
+				<< " depth_conf=" << depthResult.depth_confidence
+				<< "\n";
 		}
 
 		if (showLeft) {
