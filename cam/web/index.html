@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenCV Control Panel</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="canvas">
+      <header class="hero">
+        <div>
+          <p class="kicker">Underwater Stereo Console</p>
+          <h1>OpenCV Control Deck</h1>
+          <p class="lead">Launch cameras, switch measurement views, and tune the render pipeline from one panel.</p>
+        </div>
+        <div class="status-card">
+          <div class="status-row">
+            <span class="label">Runtime status</span>
+            <span id="run-status" class="status-pill status-idle">idle</span>
+          </div>
+          <div class="status-row">
+            <span class="label">Last command</span>
+            <span id="last-command">none</span>
+          </div>
+          <div class="status-row">
+            <span class="label">Native reply</span>
+            <span id="native-reply">waiting...</span>
+          </div>
+        </div>
+      </header>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Camera Output</h2>
+          <p>Select which windows to show, then start live view.</p>
+        </div>
+        <div class="output-grid">
+          <label class="output-toggle">
+            <input id="show-left" type="checkbox" checked />
+            <span>Left Camera</span>
+          </label>
+          <label class="output-toggle">
+            <input id="show-right" type="checkbox" checked />
+            <span>Right Camera</span>
+          </label>
+          <label class="output-toggle">
+            <input id="show-disp" type="checkbox" checked />
+            <span>Disparity Map</span>
+          </label>
+          <label class="output-toggle">
+            <input id="show-depth" type="checkbox" checked />
+            <span>Depth Map</span>
+          </label>
+        </div>
+        <div class="control-grid">
+          <button class="btn btn-live" data-action="live">Start Live View</button>
+          <button class="btn btn-yolo" data-action="yolo">Start YOLO</button>
+          <button class="btn btn-calib" data-action="calib">Open Calibration</button>
+          <button class="btn btn-stop" data-action="stop">Stop Stream</button>
+          <button class="btn btn-restart" data-action="restart">Restart Last</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Render Options</h2>
+          <p>Toggle grayscale output or underwater enhancement.</p>
+        </div>
+        <div class="toggle-row">
+          <label class="toggle">
+            <input id="gray-toggle" type="checkbox" />
+            <span class="toggle-track"></span>
+            <span class="toggle-label">Grayscale display</span>
+          </label>
+          <label class="toggle">
+            <input id="enhance-toggle" type="checkbox" checked />
+            <span class="toggle-track"></span>
+            <span class="toggle-label">Underwater enhance</span>
+          </label>
+        </div>
+        <div class="option-status">
+          <div>
+            <span class="label">Grayscale</span>
+            <span id="gray-status">off</span>
+          </div>
+          <div>
+            <span class="label">Enhance</span>
+            <span id="enhance-status">on</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="status-panel" class="panel is-hidden">
+        <div class="panel-header">
+          <h2 id="status-title">Status Feed</h2>
+          <p id="status-desc">Runtime feedback will appear here.</p>
+        </div>
+        <div id="status-hint" class="status-hint"></div>
+        <div id="status-log" class="status-log"></div>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

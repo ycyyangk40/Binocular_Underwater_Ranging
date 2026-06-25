@@ -493,11 +493,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 	if (!std::filesystem::exists(modelPath)) {
 		std::cout << "Model not found, falling back to raw camera preview.\n";
 		cv::VideoCapture capture;
-		capture.open(cameraDeviceNo);
-		capture.set(cv::CAP_PROP_FRAME_WIDTH, 2560);
-		capture.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-		capture.set(cv::CAP_PROP_FPS, 30);
-		capture.set(cv::CAP_PROP_FOURCC, cv::CAP_OPENCV_MJPEG);
+		if (!openStereoCamera(capture, cameraDeviceNo)) return;
 		cv::Mat frame;
 		while (capture.read(frame)) {
 			if (!frame.empty()) {
@@ -528,11 +524,7 @@ void yoloStereoMode(int cameraDeviceNo, bool fastMode, bool showGray, bool enhan
 	}
 
 	cv::VideoCapture capture;
-	capture.open(cameraDeviceNo);
-	capture.set(cv::CAP_PROP_FRAME_WIDTH, 2560);
-	capture.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-	capture.set(cv::CAP_PROP_FPS, 30);
-	capture.set(cv::CAP_PROP_FOURCC, cv::CAP_OPENCV_MJPEG);
+	if (!openStereoCamera(capture, cameraDeviceNo)) return;
 
 	if (showLeft) {
 		cv::namedWindow("left", cv::WINDOW_GUI_EXPANDED);
